@@ -42,3 +42,11 @@ body {
   color: #1A1A1A;
 }
 
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+}
+
