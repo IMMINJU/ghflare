@@ -54,7 +54,7 @@ The anomaly score is a ratio: `(recent daily rate) / (historical daily avg)`. Re
 | Styling | Tailwind CSS |
 | Database | Neon PostgreSQL + pgvector |
 | Embeddings | OpenAI text-embedding-3-small (1536-dim) |
-| Deployment | Vercel (cron: daily at UTC 01:00) |
+| Deployment | Vercel (UI/API) + GitHub Actions (pipeline, manual dispatch) |
 
 ---
 
@@ -70,7 +70,6 @@ Create `.env.local`:
 DATABASE_URL=        # Neon connection string
 GITHUB_TOKEN=        # GitHub PAT (public_repo read)
 OPENAI_API_KEY=      # OpenAI API key
-PIPELINE_SECRET=     # arbitrary secret for /api/pipeline/run
 ```
 
 Run DB migrations:
@@ -85,12 +84,13 @@ Start dev server:
 pnpm dev
 ```
 
-Trigger the pipeline manually:
+Run the pipeline locally:
 
 ```bash
-curl -X POST http://localhost:3000/api/pipeline/run \
-  -H "Authorization: Bearer <PIPELINE_SECRET>"
+node --env-file=.env.local --import tsx scripts/pipeline.ts
 ```
+
+Or trigger it on GitHub Actions via the **Data Pipeline** workflow (Actions tab → Run workflow). Required repo secrets: `DATABASE_URL`, `OPENAI_API_KEY`, `GH_TOKEN`.
 
 ---
 
