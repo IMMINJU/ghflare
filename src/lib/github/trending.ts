@@ -35,7 +35,11 @@ export function parseTrendingHtml(html: string): TrendingRepo[] {
     const article = articleMatch[1]
 
     // owner/repo from the h2 link: /owner/repo
-    const repoLinkMatch = article.match(/href="\/([^/]+)\/([^/"]+)"/)
+    // Scope to the <h2> so sponsor avatars (/sponsors/<user>) earlier in the
+    // article don't get picked up as the repo identity.
+    const repoLinkMatch = article.match(
+      /<h2[^>]*>[\s\S]*?href="\/([^/"]+)\/([^/"]+)"/
+    )
     if (!repoLinkMatch) continue
     const owner = repoLinkMatch[1]
     const name = repoLinkMatch[2]
