@@ -5,23 +5,33 @@ export async function upsertIssues(
   repoId: number,
   issues: RawIssue[]
 ): Promise<void> {
-  for (const issue of issues) {
-    await sql`
-      INSERT INTO issues (repo_id, issue_number, title, body, labels, created_at)
-      VALUES (
-        ${repoId},
-        ${issue.number},
-        ${issue.title},
-        ${issue.body},
-        ${issue.labels},
-        ${issue.created_at}
-      )
-      ON CONFLICT (repo_id, issue_number) DO UPDATE SET
-        title      = EXCLUDED.title,
-        body       = EXCLUDED.body,
-        labels     = EXCLUDED.labels
-    `
-  }
+  if (issues.length === 0) return
+
+  const payload = JSON.stringify(
+    issues.map((i) => ({
+      number: i.number,
+      title: i.title,
+      body: i.body,
+      labels: i.labels,
+      created_at: i.created_at,
+    }))
+  )
+
+  await sql`
+    INSERT INTO issues (repo_id, issue_number, title, body, labels, created_at)
+    SELECT
+      ${repoId},
+      (r->>'number')::int,
+      r->>'title',
+      r->>'body',
+      ARRAY(SELECT jsonb_array_elements_text(r->'labels')),
+      (r->>'created_at')::timestamptz
+    FROM jsonb_array_elements(${payload}::jsonb) AS r
+    ON CONFLICT (repo_id, issue_number) DO UPDATE SET
+      title  = EXCLUDED.title,
+      body   = EXCLUDED.body,
+      labels = EXCLUDED.labels
+  `
 }
 
 export async function getIssuesWithoutEmbeddings(
@@ -42,6 +52,26 @@ export async function updateEmbedding(
   await sql`
     UPDATE issues SET embedding = ${JSON.stringify(embedding)}::vector
     WHERE id = ${issueId}
+  `
+}
+
+export async function updateEmbeddingsBatch(
+  updates: { id: number; embedding: number[] }[]
+): Promise<void> {
+  if (updates.length === 0) return
+
+  const payload = JSON.stringify(
+    updates.map((u) => ({ id: u.id, embedding: u.embedding }))
+  )
+
+  await sql`
+    UPDATE issues
+    SET embedding = (u.e::text)::vector
+    FROM (
+      SELECT (r->>'id')::int AS id, r->'embedding' AS e
+      FROM jsonb_array_elements(${payload}::jsonb) AS r
+    ) AS u
+    WHERE issues.id = u.id
   `
 }
 

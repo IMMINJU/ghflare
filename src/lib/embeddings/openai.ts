@@ -68,3 +68,39 @@ export async function generateClusterLabel(titles: string[]): Promise<string> {
     return fallbackLabel(titles)
   }
 }
+
+export async function generateClusterLabels(
+  clusters: string[][]
+): Promise<string[]> {
+  if (clusters.length === 0) return []
+  if (clusters.length === 1) return [await generateClusterLabel(clusters[0])]
+
+  const prompt =
+    `You will receive ${clusters.length} groups of GitHub issue titles. For each group, summarize the common theme in 2–4 words. ` +
+    `Return a JSON object shaped like {"labels": ["...", "..."]} with exactly ${clusters.length} entries in the same order, and nothing else.\n\n` +
+    clusters
+      .map(
+        (titles, i) =>
+          `Group ${i + 1}:\n${titles.map((t) => `- "${t}"`).join('\n')}`
+      )
+      .join('\n\n')
+
+  try {
+    const response = await getClient().chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 30 * clusters.length,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+    })
+    const content = response.choices[0]?.message?.content ?? ''
+    const parsed = JSON.parse(content) as { labels?: unknown }
+    const labels = Array.isArray(parsed.labels) ? parsed.labels : []
+    return clusters.map((titles, i) => {
+      const label = typeof labels[i] === 'string' ? (labels[i] as string).trim() : ''
+      return label || fallbackLabel(titles)
+    })
+  } catch {
+    return clusters.map((titles) => fallbackLabel(titles))
+  }
+}
