@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { calculateK, labelCluster, kMeans } from '@/lib/analysis/cluster'
+import { calculateK, labelCluster, kMeans, buildClusterGroups } from '@/lib/analysis/cluster'
 
 describe('calculateK', () => {
   it('returns minimum of 2 for small issue counts', () => {
@@ -25,23 +25,22 @@ describe('labelCluster', () => {
     expect(labelCluster([])).toBe('Uncategorized')
   })
 
-  it('returns joined titles of up to 3 issues', () => {
+  it('derives the label from the first issue title', () => {
     const issues = [
       { title: 'Login fails' },
       { title: 'OAuth broken' },
       { title: 'Session expired' },
     ]
-    expect(labelCluster(issues)).toBe('Login fails, OAuth broken, Session expired')
+    expect(labelCluster(issues)).toBe('Login fails')
   })
 
-  it('uses only first 3 issues when more are provided', () => {
-    const issues = [
-      { title: 'A' },
-      { title: 'B' },
-      { title: 'C' },
-      { title: 'D' },
-    ]
-    expect(labelCluster(issues)).toBe('A, B, C')
+  it('strips a leading [tag]: / prefix from the title', () => {
+    expect(labelCluster([{ title: '[bug]: crash on startup' }])).toBe('crash on startup')
+  })
+
+  it('truncates titles longer than 40 characters', () => {
+    const longTitle = 'A'.repeat(50)
+    expect(labelCluster([{ title: longTitle }])).toBe('A'.repeat(40))
   })
 
   it('works with a single issue', () => {
@@ -94,5 +93,58 @@ describe('kMeans', () => {
     expect(result.assignments[0]).toBe(result.assignments[1])
     expect(result.assignments[2]).toBe(result.assignments[3])
     expect(result.assignments[0]).not.toBe(result.assignments[2])
+  })
+})
+
+describe('buildClusterGroups', () => {
+  const withEmbedding = (id: number, embedding: number[]) => ({ id, title: `t${id}`, embedding })
+
+  it('returns no groups for fewer than 2 issues', () => {
+    expect(buildClusterGroups([])).toEqual([])
+    expect(buildClusterGroups([withEmbedding(1, [1, 0, 0])])).toEqual([])
+  })
+
+  it('never emits a NaN centroid, even when k-means leaves clusters empty', () => {
+    // 4 near-duplicate points but calculateK/clamp may request more clusters
+    // than there are natural groups; empty clusters must be skipped, not
+    // averaged into NaN.
+    const issues = [
+      withEmbedding(1, [1, 0, 0]),
+      withEmbedding(2, [1, 0, 0]),
+      withEmbedding(3, [1, 0, 0]),
+      withEmbedding(4, [1, 0, 0]),
+    ]
+    const groups = buildClusterGroups(issues)
+    expect(groups.length).toBeGreaterThan(0)
+    for (const g of groups) {
+      expect(g.memberIssues.length).toBeGreaterThan(0)
+      expect(g.centroid.some((v) => Number.isNaN(v))).toBe(false)
+    }
+  })
+
+  it('assigns every issue to exactly one non-empty group', () => {
+    const issues = [
+      withEmbedding(1, [1, 0.01, 0]),
+      withEmbedding(2, [0.99, 0, 0.01]),
+      withEmbedding(3, [0, 0.01, 1]),
+      withEmbedding(4, [0.01, 0, 0.99]),
+    ]
+    const groups = buildClusterGroups(issues)
+    const assignedIds = groups.flatMap((g) => g.memberIssues.map((i) => i.id)).sort()
+    expect(assignedIds).toEqual([1, 2, 3, 4])
+  })
+
+  it('computes the centroid as the mean of member embeddings', () => {
+    const issues = [withEmbedding(1, [2, 0]), withEmbedding(2, [4, 0])]
+    const groups = buildClusterGroups(issues)
+    // k clamps to 2 here (min cluster size), so each point is its own group;
+    // centroid equals the single member. Assert the averaging path is sane.
+    for (const g of groups) {
+      const dim = g.memberIssues[0].embedding.length
+      for (let d = 0; d < dim; d++) {
+        const mean = g.memberIssues.reduce((s, i) => s + i.embedding[d], 0) / g.memberIssues.length
+        expect(g.centroid[d]).toBeCloseTo(mean)
+      }
+    }
   })
 })

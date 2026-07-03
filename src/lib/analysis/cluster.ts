@@ -56,6 +56,42 @@ function cosineDist(a: number[], b: number[]): number {
   return denom === 0 ? 1 : 1 - dot / denom
 }
 
+const EMBEDDING_DIM = 1536
+
+/**
+ * Run k-means over issues that carry an embedding and return the non-empty
+ * groups with their mean centroid. Shared by the pipeline and the on-demand
+ * cluster API so the empty-cluster handling can't drift between them: an empty
+ * cluster is skipped entirely, because averaging zero members yields a NaN
+ * centroid that pgvector rejects (which, via replaceCluster's delete-then-insert,
+ * would wipe a repo's existing clusters). k is also capped at the issue count so
+ * clusters can't outnumber points. Label generation stays with each caller
+ * (batch in the pipeline, per-cluster in the API).
+ */
+export function buildClusterGroups<T extends { embedding: number[] }>(
+  issues: T[]
+): { memberIssues: T[]; centroid: number[] }[] {
+  if (issues.length < 2) return []
+
+  const embeddings = issues.map((i) => i.embedding)
+  const k = Math.min(calculateK(embeddings.length), embeddings.length)
+  const { assignments } = kMeans(embeddings, k)
+
+  const groups: { memberIssues: T[]; centroid: number[] }[] = []
+  for (let c = 0; c < k; c++) {
+    const memberIssues = issues.filter((_, i) => assignments[i] === c)
+    if (memberIssues.length === 0) continue
+    const dim = memberIssues[0].embedding.length || EMBEDDING_DIM
+    const sum = new Array(dim).fill(0)
+    for (const issue of memberIssues) {
+      for (let d = 0; d < dim; d++) sum[d] += issue.embedding[d]
+    }
+    const centroid = sum.map((v) => v / memberIssues.length)
+    groups.push({ memberIssues, centroid })
+  }
+  return groups
+}
+
 export function labelCluster(issues: { title: string }[]): string {
   if (issues.length === 0) return 'Uncategorized'
   const first = issues[0].title
