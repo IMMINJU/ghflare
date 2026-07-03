@@ -2,6 +2,9 @@ import type { TrendingRepo } from '@/types'
 
 const TRENDING_URL = 'https://github.com/trending'
 
+// GitHub paths shaped like /owner/name that are not repositories.
+const NON_REPO_OWNERS = new Set(['sponsors', 'topics', 'collections', 'features'])
+
 export async function fetchTrendingRepos(): Promise<TrendingRepo[]> {
   const res = await fetch(TRENDING_URL, {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ghflare/1.0)' },
@@ -43,6 +46,10 @@ export function parseTrendingHtml(html: string): TrendingRepo[] {
     if (!repoLinkMatch) continue
     const owner = repoLinkMatch[1]
     const name = repoLinkMatch[2]
+
+    // Skip GitHub's own non-repo paths that can appear as /owner/name links
+    // (e.g. /sponsors/<user>). These are not real repositories.
+    if (NON_REPO_OWNERS.has(owner)) continue
 
     // description
     const descMatch = article.match(/<p[^>]*class="[^"]*col-9[^"]*"[^>]*>\s*([\s\S]*?)\s*<\/p>/)
