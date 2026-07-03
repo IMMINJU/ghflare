@@ -1,9 +1,9 @@
 import { fetchTrendingRepos } from '../src/lib/github/trending'
-import { fetchRepoIssues } from '../src/lib/github/issues'
+import { fetchRepoIssues, fetchRepoMeta } from '../src/lib/github/issues'
 import { generateEmbeddings, generateClusterLabels } from '../src/lib/embeddings/openai'
-import { detectAnomaly } from '../src/lib/analysis/anomaly'
-import { calculateK, kMeans } from '../src/lib/analysis/cluster'
-import { upsertRepo } from '../src/lib/db/repos'
+import { detectAnomaly, repoAgeInDays } from '../src/lib/analysis/anomaly'
+import { buildClusterGroups } from '../src/lib/analysis/cluster'
+import { upsertRepo, setRepoGhCreatedAt } from '../src/lib/db/repos'
 import {
   upsertIssues,
   getExistingIssueNumbers,
@@ -11,11 +11,21 @@ import {
   getIssuesForClustering,
   updateEmbeddingsBatch,
   getRecentIssueCount,
-  getHistoricalDailyAvg,
+  getBaseline,
   deleteOldIssues,
 } from '../src/lib/db/issues'
-import { upsertSnapshot } from '../src/lib/db/snapshots'
+import { upsertSnapshots, deleteOldSnapshots } from '../src/lib/db/snapshots'
+import type { SnapshotUpsert } from '../src/lib/db/snapshots'
 import { replaceCluster } from '../src/lib/db/clusters'
+import {
+  getNotificationCandidates,
+  getNotificationStates,
+  decideNotifications,
+  applyNotificationState,
+  recordNotificationEvent,
+  pruneStaleNotificationState,
+} from '../src/lib/db/notifications'
+import { sendDigest } from '../src/lib/notify/googleChat'
 import type { TrendingRepo } from '../src/types'
 
 const CONCURRENCY = 5
@@ -25,15 +35,47 @@ type RepoStats = {
   newEmbeddings: number
   newRawCount: number
   level: string
+  snapshot: SnapshotUpsert
 }
 
 async function processRepo(trending: TrendingRepo, force: boolean): Promise<RepoStats> {
-  const repoRow = await upsertRepo(trending)
+  let repoRow = await upsertRepo(trending)
 
-  const [rawIssues, existingNumbers] = await Promise.all([
+  if (!repoRow.gh_created_at) {
+    // One-time backfill of the GitHub creation date for the age gate. On
+    // failure the gate falls back to the first-seen row age (a lower bound),
+    // so a miss only over-suppresses a newly-tracked repo — log and continue.
+    try {
+      const meta = await fetchRepoMeta(trending.owner, trending.name)
+      if (meta.createdAt) {
+        await setRepoGhCreatedAt(repoRow.id, meta.createdAt)
+        repoRow = { ...repoRow, gh_created_at: meta.createdAt }
+      }
+    } catch (err) {
+      console.error(`[pipeline] repo meta failed ${trending.owner}/${trending.name}:`, err)
+    }
+  }
+
+  const [fetched, existingNumbers] = await Promise.all([
     fetchRepoIssues(trending.owner, trending.name),
     getExistingIssueNumbers(repoRow.id),
   ])
+  const { issues: rawIssues, baselineCovered } = fetched
+  if (!baselineCovered) {
+    // The page cap stopped the fetch inside the 30-day anomaly window: the
+    // baseline is undercounted, so the anomaly below is suppressed to 'normal'
+    // rather than firing a false spike. Surface it so a chronically-uncovered
+    // repo is visible to operators.
+    console.warn(
+      `[pipeline] fetch of ${trending.owner}/${trending.name} does not cover the 30d anomaly window: anomaly held to normal`
+    )
+  } else if (fetched.truncated) {
+    // 90-day window truncated but the anomaly windows are fully covered — the
+    // level is trustworthy; only clustering/timeline lose the oldest issues.
+    console.warn(
+      `[pipeline] truncated 90d fetch ${trending.owner}/${trending.name}: clustering/timeline partial, anomaly unaffected`
+    )
+  }
   const newRawIssues = force
     ? rawIssues
     : rawIssues.filter((i) => !existingNumbers.has(i.number))
@@ -43,68 +85,73 @@ async function processRepo(trending: TrendingRepo, force: boolean): Promise<Repo
   const unembedded = await getIssuesWithoutEmbeddings(repoRow.id)
   let newEmbeddings = 0
   if (unembedded.length > 0) {
-    const embedResults = await generateEmbeddings(
-      unembedded.map((i) => ({ id: i.id, title: i.title, body: i.body }))
-    )
-    await updateEmbeddingsBatch(embedResults)
-    newEmbeddings = embedResults.length
-  }
-
-  const issuesForClustering = await getIssuesForClustering(repoRow.id)
-
-  if (issuesForClustering.length >= 2) {
-    const embeddings = issuesForClustering.map((i) => i.embedding as number[])
-    const k = calculateK(embeddings.length)
-    const { assignments } = kMeans(embeddings, k)
-
-    const groups: { memberIssues: typeof issuesForClustering; centroid: number[] }[] = []
-    for (let c = 0; c < k; c++) {
-      const memberIndices = assignments
-        .map((a, i) => (a === c ? i : -1))
-        .filter((i) => i !== -1)
-      const memberIssues = memberIndices.map((i) => issuesForClustering[i])
-      const centroid = memberIssues
-        .reduce(
-          (sum, issue) => sum.map((v, d) => v + (issue.embedding as number[])[d]),
-          new Array(1536).fill(0)
-        )
-        .map((v) => v / memberIssues.length)
-      groups.push({ memberIssues, centroid })
+    // Embedding failures must not zero out the repo — the anomaly snapshot below
+    // only needs the issue rows, which are already persisted. Log and move on.
+    try {
+      const embedResults = await generateEmbeddings(
+        unembedded.map((i) => ({ id: i.id, title: i.title, body: i.body }))
+      )
+      await updateEmbeddingsBatch(embedResults)
+      newEmbeddings = embedResults.length
+    } catch (err) {
+      console.error(`[pipeline] embeddings failed ${trending.owner}/${trending.name}:`, err)
     }
-
-    const labels = await generateClusterLabels(
-      groups.map((g) => g.memberIssues.slice(0, 3).map((i) => i.title))
-    )
-
-    const clusters = groups.map((g, i) => ({
-      label: labels[i],
-      issueIds: g.memberIssues.map((m) => m.id),
-      centroid: g.centroid,
-    }))
-
-    await replaceCluster(repoRow.id, clusters)
   }
 
-  const [recentCount, historicalAvg] = await Promise.all([
-    getRecentIssueCount(repoRow.id),
-    getHistoricalDailyAvg(repoRow.id),
-  ])
-  const anomaly = detectAnomaly(recentCount, historicalAvg)
+  // Clustering is best-effort; a failure here must not block the snapshot.
+  try {
+    const issuesForClustering = await getIssuesForClustering(repoRow.id)
 
-  const today = new Date().toISOString().slice(0, 10)
-  await upsertSnapshot({
-    repoId: repoRow.id,
-    date: today,
-    issueCount: recentCount,
-    anomalyScore: anomaly.score,
-    anomalyLevel: anomaly.level,
-  })
+    const clusterable = issuesForClustering.map((i) => ({ ...i, embedding: i.embedding as number[] }))
+    const groups = buildClusterGroups(clusterable)
+
+    if (groups.length > 0) {
+      const labels = await generateClusterLabels(
+        groups.map((g) => g.memberIssues.slice(0, 3).map((i) => i.title))
+      )
+
+      const clusters = groups.map((g, i) => ({
+        label: labels[i],
+        issueIds: g.memberIssues.map((m) => m.id),
+        centroid: g.centroid,
+      }))
+
+      await replaceCluster(repoRow.id, clusters)
+    }
+  } catch (err) {
+    console.error(`[pipeline] clustering failed ${trending.owner}/${trending.name}:`, err)
+  }
+
+  const [recentCount, baseline] = await Promise.all([
+    getRecentIssueCount(repoRow.id),
+    getBaseline(repoRow.id),
+  ])
+  const anomaly = detectAnomaly(
+    recentCount,
+    baseline.dailyAvg,
+    baseline.count,
+    !baselineCovered,
+    // First-seen row age as the fallback: a lower bound on true age, so a
+    // failed meta backfill can only over-suppress a newly-tracked repo — never
+    // let a young repo alert just because gh_created_at is missing.
+    repoAgeInDays(repoRow.gh_created_at ?? repoRow.created_at)
+  )
 
   return {
     issuesCollected: rawIssues.length,
     newEmbeddings,
     newRawCount: newRawIssues.length,
     level: anomaly.level,
+    // Persisted by main() in one batch after every repo finishes — see
+    // upsertSnapshots for why a run's snapshots must land together.
+    snapshot: {
+      repoId: repoRow.id,
+      issueCount: recentCount,
+      anomalyScore: anomaly.score,
+      anomalyLevel: anomaly.level,
+      pValue: anomaly.pValue,
+      expectedCount: anomaly.expectedCount,
+    },
   }
 }
 
@@ -133,11 +180,53 @@ async function runWithConcurrency<T, R>(
   return results
 }
 
+// Send a Google Chat digest of the anomalies detected this run, then persist
+// dedup state. Best-effort: any failure here is logged and swallowed so it
+// never fails the data pipeline.
+async function runNotifications(runDate: string): Promise<void> {
+  try {
+    const [candidates, priorStates] = await Promise.all([
+      getNotificationCandidates(),
+      getNotificationStates(),
+    ])
+    const { toNotify, notifiedUpserts, steadyUpserts, stateClears } = decideNotifications(
+      candidates,
+      priorStates
+    )
+
+    const result = await sendDigest(toNotify, runDate)
+
+    // Contract (see notifications.ts): steady updates and normal-resets reflect
+    // what we observed and must persist regardless of the send outcome, or a
+    // later re-escalation / re-alert is missed. The notified repos' state only
+    // advances when the digest actually went out (sent/dry_run) — on failure we
+    // leave them unnotified so the next run retries them.
+    const sendSucceeded = result.status === 'sent' || result.status === 'dry_run'
+    const upserts = sendSucceeded ? [...steadyUpserts, ...notifiedUpserts] : steadyUpserts
+    await applyNotificationState(runDate, upserts, stateClears)
+
+    await recordNotificationEvent({
+      runDate,
+      status: result.status,
+      repoCount: result.repoCount,
+      error: result.status === 'failed' ? result.error : undefined,
+    })
+    console.log(`[pipeline] notify  status=${result.status}  notified=${toNotify.length}`)
+
+    await pruneStaleNotificationState()
+  } catch (err) {
+    console.error('[pipeline] notify failed:', err)
+  }
+}
+
 async function main() {
   const force = process.argv.includes('--force')
   const start = Date.now()
+  // One date for the whole run: per-repo dates would split a run that crosses
+  // UTC midnight and desync the snapshot universe from the notification reads.
+  const runDate = new Date().toISOString().slice(0, 10)
 
-  console.log('[pipeline] start')
+  console.log(`[pipeline] start  date=${runDate}`)
 
   const trendingRepos = await fetchTrendingRepos()
   console.log(`[pipeline] trending parsed  repos=${trendingRepos.length}  concurrency=${CONCURRENCY}`)
@@ -165,8 +254,23 @@ async function main() {
     console.log(`[pipeline] ${owner}/${name}  level=${stats.level}  new=${stats.newRawCount}`)
   }
 
+  // One batch write for the whole run: the feed's date universe (MAX(date)
+  // over pipeline snapshots) must not flip to today until every repo's
+  // snapshot can land with it. Repos that errored above are simply absent.
+  const snapshots = outcomes
+    .filter((o) => !o.error && o.result)
+    .map((o) => o.result!.snapshot)
+  await upsertSnapshots(runDate, snapshots)
+  console.log(`[pipeline] snapshots written  count=${snapshots.length}  date=${runDate}`)
+
+  // Notify before cleanup: the digest reads the snapshots and clusters we just
+  // wrote, and keeping it ahead of cleanup separates alert failures from
+  // retention failures.
+  await runNotifications(runDate)
+
   try {
     await deleteOldIssues()
+    await deleteOldSnapshots()
   } catch (err) {
     console.error('[pipeline] cleanup failed:', err)
   }
