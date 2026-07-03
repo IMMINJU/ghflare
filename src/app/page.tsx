@@ -1,11 +1,14 @@
 import { RepoCard } from '@/components/RepoCard'
 import { sql } from '@/lib/db/client'
+import { getHistoricalDailyAvg } from '@/lib/db/issues'
 import type { AnomalousRepo } from '@/types'
 
 export const revalidate = 1800
 
 async function getTrendingData(): Promise<{ repos: AnomalousRepo[]; updatedAt: string | null }> {
   try {
+    // Pipeline snapshots only: a manual analyze after UTC midnight would
+    // otherwise advance MAX(date) and collapse the feed to that one repo.
     const rows = await sql`
       SELECT
         r.id AS repo_id,
@@ -17,50 +20,40 @@ async function getTrendingData(): Promise<{ repos: AnomalousRepo[]; updatedAt: s
         s.anomaly_score,
         s.anomaly_level,
         s.issue_count,
-        s.created_at AS snapshot_time
+        s.updated_at AS snapshot_time
       FROM snapshots s
       JOIN repos r ON r.id = s.repo_id
-      WHERE s.date = CURRENT_DATE
+      WHERE s.source = 'pipeline'
+        AND s.date = (SELECT MAX(date) FROM snapshots WHERE source = 'pipeline')
         AND s.anomaly_level IN ('elevated', 'spike')
-      ORDER BY s.anomaly_score DESC
+      ORDER BY s.anomaly_p_value ASC NULLS LAST, s.anomaly_score DESC
       LIMIT 25
     `
 
     if (rows.length === 0) {
-      const latest = await sql`SELECT MAX(created_at) AS ts FROM snapshots`
+      const latest = await sql`SELECT MAX(updated_at) AS ts FROM snapshots WHERE source = 'pipeline'`
       return { repos: [], updatedAt: (latest[0]?.ts as string) ?? null }
     }
 
     const repos: AnomalousRepo[] = await Promise.all(
       rows.map(async (row) => {
         const repoId = row.repo_id as number
-        const [clusters, historicalRows, recentRows] = await Promise.all([
+        const [clusters, historicalAvg] = await Promise.all([
           sql`
             SELECT label FROM clusters
             WHERE repo_id = ${repoId}
             ORDER BY created_at DESC
             LIMIT 2
           `,
-          sql`
-            SELECT AVG(daily_count)::float AS avg FROM (
-              SELECT DATE(created_at), COUNT(*) AS daily_count
-              FROM issues
-              WHERE repo_id = ${repoId}
-                AND created_at >= NOW() - INTERVAL '30 days'
-                AND created_at < NOW() - INTERVAL '7 days'
-              GROUP BY DATE(created_at)
-            ) sub
-          `,
-          sql`
-            SELECT COUNT(*)::int AS count FROM issues
-            WHERE repo_id = ${repoId}
-              AND created_at >= NOW() - INTERVAL '7 days'
-          `,
+          getHistoricalDailyAvg(repoId),
         ])
 
-        const historicalAvg = Number(historicalRows[0]?.avg ?? 0)
-        const recentCount = recentRows[0].count as number
-        const multiplier = historicalAvg > 0 ? (recentCount / 7) / historicalAvg : 1
+        // Single source of truth: the pipeline already computed the anomaly
+        // against the floored 23-day baseline and stored score = multiplier - 1.
+        // Derive the displayed multiplier from that — do not recompute here with
+        // a different baseline definition (that was the 3-way divergence bug).
+        const recentCount = row.issue_count as number
+        const multiplier = ((row.anomaly_score as number) ?? 0) + 1
 
         return {
           owner: row.owner as string,

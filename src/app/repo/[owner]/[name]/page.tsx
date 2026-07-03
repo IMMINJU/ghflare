@@ -7,9 +7,10 @@ import { AnalyzeButton } from '@/components/AnalyzeButton'
 import { AnomalyBadge } from '@/components/AnomalyBadge'
 import { FetchRepoData } from '@/components/FetchRepoData'
 import { getRepoByOwnerName, upsertRepo } from '@/lib/db/repos'
-import { getTimelineData, getRecentIssueCount, getHistoricalDailyAvg } from '@/lib/db/issues'
+import { getTimelineData, getRecentIssueCount, getBaseline } from '@/lib/db/issues'
 import { getClustersWithIssues } from '@/lib/db/clusters'
-import { detectAnomaly } from '@/lib/analysis/anomaly'
+import { getLatestSnapshot } from '@/lib/db/snapshots'
+import { resolveDisplayAnomaly } from '@/lib/analysis/anomaly'
 import { fetchRepoMeta } from '@/lib/github/issues'
 import type { TimelinePoint, ClusterDetail } from '@/types'
 
@@ -35,6 +36,18 @@ const LANGUAGE_COLORS: Record<string, string> = {
 }
 
 type Props = { params: Promise<{ owner: string; name: string }> }
+
+// "analyzed 3h ago" — when the badge's level was computed (snapshot time).
+// Null when the badge came from a live recompute (current as of this render).
+function formatAnalyzedAt(iso: string | null): string | null {
+  if (!iso) return null
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60_000)
+  if (!Number.isFinite(mins) || mins < 0) return null
+  if (mins < 60) return `analyzed ${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `analyzed ${hours}h ago`
+  return `analyzed ${Math.floor(hours / 24)}d ago`
+}
 
 export async function generateMetadata({ params }: Props) {
   const { owner, name } = await params
@@ -145,15 +158,30 @@ export default async function RepoPage({ params }: Props) {
     )
   }
 
-  const [timelineData, clusterRows, recentCount, historicalAvg] = await Promise.all([
+  const [timelineData, clusterRows, recentCount, baseline, snapshot] = await Promise.all([
     getTimelineData(repo.id),
     getClustersWithIssues(repo.id),
     getRecentIssueCount(repo.id),
-    getHistoricalDailyAvg(repo.id),
+    getBaseline(repo.id),
+    getLatestSnapshot(repo.id),
   ])
+  const historicalAvg = baseline.dailyAvg
 
-  const anomaly = detectAnomaly(recentCount, historicalAvg)
+  // Snapshot-first: the stored level already applied the fetch-coverage and
+  // age gates, which a live recompute from stored issues can't know — without
+  // this the badge could show a spike the feed/digest suppressed.
+  const anomaly = resolveDisplayAnomaly(
+    snapshot,
+    repo.gh_created_at ?? repo.created_at,
+    recentCount,
+    historicalAvg,
+    baseline.count
+  )
+  const analyzedLabel = formatAnalyzedAt(anomaly.analyzedAt)
 
+  // Floored baseline matches detectAnomaly so the timeline highlights agree with
+  // the anomaly badge (min 2 issues/day to mark — see the API route for detail).
+  const dailyBaseline = Math.max(historicalAvg, 1 / 7)
   const countByDate = new Map(timelineData.map((r) => [r.date, r.count]))
   const timeline: TimelinePoint[] = []
   for (let d = 89; d >= 0; d--) {
@@ -164,7 +192,7 @@ export default async function RepoPage({ params }: Props) {
     timeline.push({
       date: dateStr,
       count,
-      isAnomalous: historicalAvg > 0 && count > historicalAvg * 2,
+      isAnomalous: count >= 2 && count > dailyBaseline * 2,
     })
   }
 
@@ -180,9 +208,11 @@ export default async function RepoPage({ params }: Props) {
     })),
   }))
 
-  const increaseLabel =
-    historicalAvg === 0 ? '—' : `+${Math.round((anomaly.multiplier - 1) * 100)}%`
-  const currentRate = (recentCount / 7).toFixed(1)
+  // Increase is always meaningful now — detectAnomaly floors the baseline, so
+  // even a zero-history repo has a real multiplier (not the old '—' placeholder).
+  const increaseLabel = `+${Math.round((anomaly.multiplier - 1) * 100)}%`
+  const currentRate = (anomaly.recentCount / 7).toFixed(1)
+  // Baseline still shows '—' when there were literally no prior issues.
   const baselineRate = historicalAvg > 0 ? historicalAvg.toFixed(1) : '—'
 
   return (
@@ -201,8 +231,11 @@ export default async function RepoPage({ params }: Props) {
           <h1 className="font-serif text-5xl font-semibold text-text-primary leading-tight">
             {owner}/{name}
           </h1>
-          <div className="mt-2">
+          <div className="mt-2 flex items-center gap-3">
             <AnomalyBadge level={anomaly.level} multiplier={anomaly.multiplier} />
+            {analyzedLabel && (
+              <span className="text-xs text-text-muted font-mono">{analyzedLabel}</span>
+            )}
           </div>
         </div>
 
@@ -262,7 +295,7 @@ export default async function RepoPage({ params }: Props) {
         <StatCard
           icon={<AlertTriangle className="w-4 h-4" />}
           label="Issues / 7d"
-          value={recentCount.toLocaleString()}
+          value={anomaly.recentCount.toLocaleString()}
         />
       </div>
 

@@ -3,7 +3,7 @@ import type { ErrorResponse } from '@/types'
 import { getRepoByOwnerName } from '@/lib/db/repos'
 import { getIssuesWithoutEmbeddings, getIssuesForClustering, updateEmbedding } from '@/lib/db/issues'
 import { generateEmbeddings, generateClusterLabel } from '@/lib/embeddings/openai'
-import { calculateK, kMeans } from '@/lib/analysis/cluster'
+import { buildClusterGroups } from '@/lib/analysis/cluster'
 import { replaceCluster } from '@/lib/db/clusters'
 
 const OWNER_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/
@@ -44,34 +44,22 @@ export async function POST(
       }
     }
 
-    // Cluster
+    // Cluster. buildClusterGroups skips empty clusters, so no NaN centroid can
+    // reach replaceCluster and wipe this repo's clusters (see cluster.ts).
     const issuesForClustering = await getIssuesForClustering(repo.id)
-    if (issuesForClustering.length < 2) {
+    const clusterable = issuesForClustering.map((i) => ({ ...i, embedding: i.embedding as number[] }))
+    const groups = buildClusterGroups(clusterable)
+    if (groups.length === 0) {
       return NextResponse.json({ success: true })
     }
 
-    const embeddings = issuesForClustering.map((i) => i.embedding as number[])
-    const k = calculateK(embeddings.length)
-    const { assignments } = kMeans(embeddings, k)
-
-    const clusters: { label: string; issueIds: number[]; centroid: number[] }[] = []
-    for (let c = 0; c < k; c++) {
-      const memberIndices = assignments
-        .map((a, i) => (a === c ? i : -1))
-        .filter((i) => i !== -1)
-      const memberIssues = memberIndices.map((i) => issuesForClustering[i])
-      const centroid = memberIssues
-        .reduce(
-          (sum, issue) => sum.map((v, d) => v + (issue.embedding as number[])[d]),
-          new Array(1536).fill(0)
-        )
-        .map((v) => v / memberIssues.length)
-
-      const label = await generateClusterLabel(
-        memberIssues.slice(0, 3).map((i) => i.title)
-      )
-      clusters.push({ label, issueIds: memberIssues.map((i) => i.id), centroid })
-    }
+    const clusters = await Promise.all(
+      groups.map(async (g) => ({
+        label: await generateClusterLabel(g.memberIssues.slice(0, 3).map((i) => i.title)),
+        issueIds: g.memberIssues.map((i) => i.id),
+        centroid: g.centroid,
+      }))
+    )
 
     await replaceCluster(repo.id, clusters)
 

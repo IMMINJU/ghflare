@@ -36,9 +36,12 @@ export function RepoCard({ repo }: Props) {
   const { owner, name, description, anomaly, topTopics, stars, language, detectedAt } = repo
   const validTopics = topTopics.filter((t) => t.length <= 40)
 
-  const increaseLabel =
-    anomaly.historicalAvg === 0 ? '—' : `+${Math.round((anomaly.multiplier - 1) * 100)}%`
+  // Increase is always meaningful now — detectAnomaly floors the baseline, so
+  // even a zero-history repo has a real multiplier (not the old '—' placeholder).
+  const increaseLabel = `+${Math.round((anomaly.multiplier - 1) * 100)}%`
   const currentRate = (anomaly.recentCount / 7).toFixed(1)
+  // Baseline still shows '—' when there were literally no prior issues: that's
+  // an honest "no recorded baseline", distinct from the floor used for scoring.
   const baselineRate = anomaly.historicalAvg > 0 ? anomaly.historicalAvg.toFixed(1) : '—'
 
   return (

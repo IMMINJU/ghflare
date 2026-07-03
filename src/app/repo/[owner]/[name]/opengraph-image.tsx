@@ -1,7 +1,8 @@
 import { ImageResponse } from 'next/og'
 import { getRepoByOwnerName } from '@/lib/db/repos'
-import { getRecentIssueCount, getHistoricalDailyAvg } from '@/lib/db/issues'
-import { detectAnomaly } from '@/lib/analysis/anomaly'
+import { getRecentIssueCount, getBaseline } from '@/lib/db/issues'
+import { getLatestSnapshot } from '@/lib/db/snapshots'
+import { resolveDisplayAnomaly } from '@/lib/analysis/anomaly'
 import { sql } from '@/lib/db/client'
 
 export const alt = 'ghflare repo analysis'
@@ -27,20 +28,28 @@ export default async function OGImage({ params }: Props) {
   try {
     const repo = await getRepoByOwnerName(owner, name)
     if (repo) {
-      const [rc, ha, clusters] = await Promise.all([
+      const [rc, baseline, clusters, snapshot] = await Promise.all([
         getRecentIssueCount(repo.id),
-        getHistoricalDailyAvg(repo.id),
+        getBaseline(repo.id),
         sql`
           SELECT label FROM clusters
           WHERE repo_id = ${repo.id}
           ORDER BY created_at DESC
           LIMIT 2
         `,
+        getLatestSnapshot(repo.id),
       ])
-      const anomaly = detectAnomaly(rc, ha)
+      // Snapshot-first so the OG card matches the feed and badge (anomaly.ts).
+      const anomaly = resolveDisplayAnomaly(
+        snapshot,
+        repo.gh_created_at ?? repo.created_at,
+        rc,
+        baseline.dailyAvg,
+        baseline.count
+      )
       level = anomaly.level
       multiplier = anomaly.multiplier
-      recentCount = rc
+      recentCount = anomaly.recentCount
       topTopics = clusters.map((c) => c.label as string)
     }
   } catch {

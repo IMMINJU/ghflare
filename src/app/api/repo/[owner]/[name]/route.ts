@@ -2,9 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 import type { RepoDetailResponse, TimelinePoint, ClusterDetail, ErrorResponse } from '@/types'
 import { sql } from '@/lib/db/client'
 import { getRepoByOwnerName } from '@/lib/db/repos'
-import { getTimelineData, getRecentIssueCount, getHistoricalDailyAvg } from '@/lib/db/issues'
+import { getTimelineData, getRecentIssueCount, getBaseline } from '@/lib/db/issues'
 import { getClustersWithIssues } from '@/lib/db/clusters'
-import { detectAnomaly } from '@/lib/analysis/anomaly'
+import { getLatestSnapshot } from '@/lib/db/snapshots'
+import { resolveDisplayAnomaly } from '@/lib/analysis/anomaly'
 
 const OWNER_REGEX = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$/
 const NAME_REGEX = /^[a-zA-Z0-9._-]{1,100}$/
@@ -33,17 +34,31 @@ export async function GET(
       )
     }
 
-    const [timelineData, clusterRows, recentCount, historicalAvg] = await Promise.all([
+    const [timelineData, clusterRows, recentCount, baseline, snapshot] = await Promise.all([
       getTimelineData(repo.id),
       getClustersWithIssues(repo.id),
       getRecentIssueCount(repo.id),
-      getHistoricalDailyAvg(repo.id),
+      getBaseline(repo.id),
+      getLatestSnapshot(repo.id),
     ])
+    const historicalAvg = baseline.dailyAvg
 
-    const anomaly = detectAnomaly(recentCount, historicalAvg)
+    // Snapshot-first: the stored level already applied the fetch-coverage and
+    // age gates, which a live recompute from stored issues can't know.
+    const anomaly = resolveDisplayAnomaly(
+      snapshot,
+      repo.gh_created_at ?? repo.created_at,
+      recentCount,
+      historicalAvg,
+      baseline.count
+    )
 
-    // Build 90-day timeline with daily avg for anomaly markers
-    const dailyAvg = historicalAvg
+    // Build 90-day timeline with daily avg for anomaly markers. Use the same
+    // floored baseline as detectAnomaly (min ~1 issue/week) so a zero-history
+    // repo whose badge reads "spike" also shows highlighted days — otherwise the
+    // badge and the timeline disagree. A day needs at least 2 issues to mark, so
+    // the floor doesn't light up every single-issue day on a dead repo.
+    const dailyBaseline = Math.max(historicalAvg, 1 / 7)
     const countByDate = new Map(timelineData.map((r) => [r.date, r.count]))
     const timeline: TimelinePoint[] = []
     for (let d = 89; d >= 0; d--) {
@@ -54,7 +69,7 @@ export async function GET(
       timeline.push({
         date: dateStr,
         count,
-        isAnomalous: dailyAvg > 0 && count > dailyAvg * 2,
+        isAnomalous: count >= 2 && count > dailyBaseline * 2,
       })
     }
 
@@ -80,9 +95,10 @@ export async function GET(
       anomaly: {
         level: anomaly.level,
         score: anomaly.score,
-        recentCount,
+        recentCount: anomaly.recentCount,
         historicalAvg,
         multiplier: anomaly.multiplier,
+        analyzedAt: anomaly.analyzedAt,
       },
       timeline,
       clusters,
