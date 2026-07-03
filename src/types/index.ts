@@ -24,9 +24,11 @@ export type RawIssue = {
 export type AnomalyLevel = 'normal' | 'elevated' | 'spike'
 
 export type AnomalyResult = {
-  score: number        // ratio - 1 (0 = baseline)
+  score: number          // multiplier - 1 (0 = baseline); kept for sort/display compat
   level: AnomalyLevel
-  multiplier: number   // e.g. 6.0 = 6x usual activity
+  multiplier: number     // e.g. 6.0 = 6x usual activity
+  pValue: number         // quasi-Poisson upper-tail p-value (lower = more unusual)
+  expectedCount: number  // λ₇ = expected issues over the 7-day window
 }
 
 // --- Clustering ---
@@ -46,6 +48,10 @@ export type RepoRow = {
   description: string | null
   language: string | null
   stars: number
+  // Repo creation date on GitHub (drives the anomaly age gate) — distinct from
+  // created_at below, which is when this row was inserted. NULL until the
+  // pipeline backfills it from /repos/{owner}/{name}.
+  gh_created_at: string | null
   created_at: string
   updated_at: string
 }
@@ -62,6 +68,10 @@ export type IssueRow = {
   indexed_at: string
 }
 
+// Who wrote a snapshot. The feed/digest date universe is 'pipeline' only, so a
+// manual analyze can't shift it (see migration 004).
+export type SnapshotSource = 'pipeline' | 'manual'
+
 export type SnapshotRow = {
   id: number
   repo_id: number
@@ -69,7 +79,11 @@ export type SnapshotRow = {
   issue_count: number
   anomaly_score: number | null
   anomaly_level: AnomalyLevel | null
+  anomaly_p_value: number | null
+  expected_count: number | null
+  source: SnapshotSource
   created_at: string
+  updated_at: string
 }
 
 export type ClusterRow = {
@@ -135,6 +149,9 @@ export type RepoDetailResponse = {
     recentCount: number
     historicalAvg: number
     multiplier: number
+    // When the displayed level was computed (snapshot.updated_at); null when it
+    // came from a live recompute rather than a stored snapshot.
+    analyzedAt: string | null
   }
   timeline: TimelinePoint[]
   clusters: ClusterDetail[]

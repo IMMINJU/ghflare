@@ -25,8 +25,11 @@ CREATE TABLE issues (
   UNIQUE(repo_id, issue_number)
 );
 
-CREATE INDEX ON issues USING ivfflat (embedding vector_cosine_ops)
-  WITH (lists = 100);
+-- No ANN index on issues.embedding: similarity is computed in application code
+-- (k-means in src/lib/analysis/cluster.ts reads full rows), so an ivfflat/hnsw
+-- index is never probed by a query. It only inflated storage (~200MB) and was
+-- dropped. Re-add an index here ONLY if you introduce a vector search query
+-- (e.g. `ORDER BY embedding <=> $1`).
 
 CREATE TABLE snapshots (
   id             SERIAL PRIMARY KEY,

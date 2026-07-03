@@ -15,6 +15,17 @@ export async function upsertRepo(repo: TrendingRepo): Promise<RepoRow> {
   return rows[0] as RepoRow
 }
 
+// One-time backfill of the GitHub creation date (immutable, so callers only
+// invoke this when the row's gh_created_at is still NULL).
+export async function setRepoGhCreatedAt(
+  repoId: number,
+  ghCreatedAt: string
+): Promise<void> {
+  await sql`
+    UPDATE repos SET gh_created_at = ${ghCreatedAt} WHERE id = ${repoId}
+  `
+}
+
 export async function getRepoByOwnerName(
   owner: string,
   name: string

@@ -5,6 +5,12 @@ export async function replaceCluster(
   repoId: number,
   clusters: Cluster[]
 ): Promise<void> {
+  // NOTE: DELETE-then-INSERT is not atomic on the Neon HTTP driver (no
+  // interactive transaction; sql.transaction() only takes a static array, which
+  // this id-dependent loop can't express). If an INSERT throws mid-loop the old
+  // clusters are already gone. Acceptable for now because the empty-cluster skip
+  // in the pipeline removed the main failure cause; revisit with a single CTE
+  // (WITH ins AS (INSERT ... RETURNING) ...) if this proves flaky.
   await sql`DELETE FROM clusters WHERE repo_id = ${repoId}`
 
   for (const cluster of clusters) {

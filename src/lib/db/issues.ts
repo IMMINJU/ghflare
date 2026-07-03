@@ -93,28 +93,50 @@ export async function getRecentIssueCount(repoId: number): Promise<number> {
   return rows[0].count as number
 }
 
-export async function getHistoricalDailyAvg(repoId: number): Promise<number> {
+// Baseline window is the 23 days from 30d ago up to 7d ago. We divide the total
+// issue count by the full 23-day span (not by active days only) so that days
+// with zero issues correctly pull the average down — otherwise sparse repos get
+// an inflated baseline and their anomalies are under-reported.
+const BASELINE_DAYS = 23
+
+export type Baseline = {
+  dailyAvg: number // issues/day over the 23-day window
+  count: number    // raw issue count in the window (drives the confidence gate)
+}
+
+// Returns both the daily average and the raw count over the baseline window in a
+// single query. The count is what the anomaly gate uses to decide whether we
+// know this repo's "normal" at all: a repo with too few baseline issues has no
+// trustworthy expectation to compare today against, so it must never alert.
+export async function getBaseline(repoId: number): Promise<Baseline> {
   const rows = await sql`
-    SELECT AVG(daily_count) AS avg FROM (
-      SELECT DATE(created_at), COUNT(*) AS daily_count
-      FROM issues
-      WHERE repo_id = ${repoId}
-        AND created_at >= NOW() - INTERVAL '30 days'
-        AND created_at < NOW() - INTERVAL '7 days'
-      GROUP BY DATE(created_at)
-    ) sub
+    SELECT COUNT(*)::int AS count
+    FROM issues
+    WHERE repo_id = ${repoId}
+      AND created_at >= NOW() - INTERVAL '30 days'
+      AND created_at < NOW() - INTERVAL '7 days'
   `
-  return Number(rows[0].avg ?? 0)
+  const count = Number(rows[0].count ?? 0)
+  return { dailyAvg: count / BASELINE_DAYS, count }
+}
+
+export async function getHistoricalDailyAvg(repoId: number): Promise<number> {
+  return (await getBaseline(repoId)).dailyAvg
 }
 
 export async function getIssuesForClustering(
   repoId: number
 ): Promise<IssueRow[]> {
+  // Deterministic order: k-means seeds its centroids from the first k rows
+  // (cluster.ts), so without an explicit ORDER BY the clustering — and the
+  // labels shown in the feed and the Chat digest — would drift between runs
+  // purely from Postgres row ordering.
   const rows = await sql`
     SELECT * FROM issues
     WHERE repo_id = ${repoId}
       AND embedding IS NOT NULL
       AND created_at >= NOW() - INTERVAL '90 days'
+    ORDER BY created_at DESC, id DESC
   `
   return rows.map((r) => ({
     ...r,

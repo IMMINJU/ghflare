@@ -20,25 +20,40 @@ function buildInput(title: string, body: string | null): string {
   return `${title} ${body?.slice(0, BODY_TRUNCATE) ?? ''}`.trim()
 }
 
+async function embedBatch(
+  batch: { id: number; title: string; body: string | null }[],
+  attempt = 1
+): Promise<{ id: number; embedding: number[] }[]> {
+  const inputs = batch.map((issue) => buildInput(issue.title, issue.body))
+  try {
+    const response = await getClient().embeddings.create({ model: MODEL, input: inputs })
+    return batch.map((issue, j) => ({ id: issue.id, embedding: response.data[j].embedding }))
+  } catch (err) {
+    if (attempt < 3) {
+      await new Promise((r) => setTimeout(r, attempt * 1000))
+      return embedBatch(batch, attempt + 1)
+    }
+    throw err
+  }
+}
+
 export async function generateEmbeddings(
   issues: { id: number; title: string; body: string | null }[]
 ): Promise<{ id: number; embedding: number[] }[]> {
   const results: { id: number; embedding: number[] }[] = []
 
+  // Embed batch-by-batch with isolation: one failing batch (e.g. a transient
+  // rate-limit) must not discard the issues that did embed successfully. Stuck
+  // issues are simply retried on the next run via getIssuesWithoutEmbeddings.
   for (let i = 0; i < issues.length; i += BATCH_SIZE) {
     const batch = issues.slice(i, i + BATCH_SIZE)
-    const inputs = batch.map((issue) => buildInput(issue.title, issue.body))
-
-    const response = await getClient().embeddings.create({
-      model: MODEL,
-      input: inputs,
-    })
-
-    for (let j = 0; j < batch.length; j++) {
-      results.push({
-        id: batch[j].id,
-        embedding: response.data[j].embedding,
-      })
+    try {
+      results.push(...(await embedBatch(batch)))
+    } catch (err) {
+      console.error(
+        `[embeddings] batch failed after retries (issues ${batch[0]?.id}..${batch[batch.length - 1]?.id}):`,
+        err
+      )
     }
   }
 
