@@ -3,7 +3,9 @@ import type { TrendingResponse, AnomalousRepo, ErrorResponse } from '@/types'
 import { sql } from '@/lib/db/client'
 import { getHistoricalDailyAvg } from '@/lib/db/issues'
 
-export const revalidate = 1800
+// Same reasoning as the page: serve the latest pipeline snapshot on every
+// request rather than a cached-up-to-30-min response. See src/app/page.tsx.
+export const dynamic = 'force-dynamic'
 
 export async function GET() {
   try {

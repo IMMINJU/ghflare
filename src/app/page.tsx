@@ -3,7 +3,11 @@ import { sql } from '@/lib/db/client'
 import { getHistoricalDailyAvg } from '@/lib/db/issues'
 import type { AnomalousRepo } from '@/types'
 
-export const revalidate = 1800
+// Data lands once a day from the pipeline (cron), but the feed reads the DB
+// directly and must reflect the newest snapshot on the next visit — not after a
+// stale-while-revalidate window that made new data appear only on a hard reload.
+// The query is a single fast DB read, so per-request rendering is cheap.
+export const dynamic = 'force-dynamic'
 
 async function getTrendingData(): Promise<{ repos: AnomalousRepo[]; updatedAt: string | null }> {
   try {
