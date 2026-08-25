@@ -2,7 +2,10 @@ import OpenAI from 'openai'
 
 const MODEL = 'text-embedding-3-small'
 const BATCH_SIZE = 100
-const BODY_TRUNCATE = 500
+// Exported because the storage layer truncates persisted bodies to this same
+// bound (upsertIssues): bodies exist only to be embedded, and a re-embed must
+// see the same text the original embed saw.
+export const BODY_TRUNCATE = 500
 
 let client: OpenAI | null = null
 

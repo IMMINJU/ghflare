@@ -1,4 +1,5 @@
 import { sql } from './client'
+import { BODY_TRUNCATE } from '../embeddings/openai'
 import type { IssueRow, RawIssue } from '@/types'
 
 export async function upsertIssues(
@@ -11,7 +12,10 @@ export async function upsertIssues(
     issues.map((i) => ({
       number: i.number,
       title: i.title,
-      body: i.body,
+      // Bodies are never rendered, only fed to the embedding input — which
+      // reads at most BODY_TRUNCATE chars. Anything past that is dead weight
+      // (full bodies were ~3x the bytes actually consumed).
+      body: i.body?.slice(0, BODY_TRUNCATE) ?? null,
       labels: i.labels,
       created_at: i.created_at,
     }))
