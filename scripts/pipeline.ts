@@ -3,7 +3,12 @@ import { fetchRepoIssues, fetchRepoMeta } from '../src/lib/github/issues'
 import { generateEmbeddings, generateClusterLabels } from '../src/lib/embeddings/openai'
 import { detectAnomaly, repoAgeInDays } from '../src/lib/analysis/anomaly'
 import { buildClusterGroups } from '../src/lib/analysis/cluster'
-import { upsertRepo, setRepoGhCreatedAt } from '../src/lib/db/repos'
+import {
+  upsertRepo,
+  setRepoGhCreatedAt,
+  getStaleRepoIds,
+  deleteReposByIds,
+} from '../src/lib/db/repos'
 import {
   upsertIssues,
   getExistingIssueNumbers,
@@ -268,11 +273,42 @@ async function main() {
   // retention failures.
   await runNotifications(runDate)
 
-  try {
-    await deleteOldIssues()
-    await deleteOldSnapshots()
-  } catch (err) {
-    console.error('[pipeline] cleanup failed:', err)
+  // Each step runs in its own try so one failure can't skip the rest. They
+  // used to share a block, which meant a throw in the age cleanup silently
+  // stopped the stale prune below it — and the swallowed error still let the
+  // job finish green.
+  let cleanupFailed = false
+  const step = async (label: string, fn: () => Promise<void>) => {
+    try {
+      await fn()
+    } catch (err) {
+      cleanupFailed = true
+      console.error(`[pipeline] cleanup step failed  step=${label}:`, err)
+    }
+  }
+
+  await step('deleteOldIssues', deleteOldIssues)
+  await step('deleteOldSnapshots', deleteOldSnapshots)
+
+  // Storage guard (Neon free tier is 0.5GB): repos that fell out of trending
+  // otherwise hold up to 90 days of unread issues at ~6KB/row of embedding.
+  // Runs after deleteOldSnapshots so a repo whose snapshots all just aged out
+  // is treated as stale in the same run. Deleting the repo row cascades to its
+  // issues, clusters, snapshots and notification state — see deleteReposByIds
+  // for why the row itself has to go.
+  await step('pruneStaleRepos', async () => {
+    const staleRepoIds = await getStaleRepoIds()
+    await deleteReposByIds(staleRepoIds)
+    if (staleRepoIds.length > 0) {
+      console.log(`[pipeline] stale repos pruned  repos=${staleRepoIds.length}`)
+    }
+  })
+
+  // Surface a broken cleanup instead of ending green: retention failing
+  // silently is how the DB filled up in the first place.
+  if (cleanupFailed) {
+    console.error('[pipeline] cleanup incomplete — see step failures above')
+    process.exitCode = 1
   }
 
   const duration = Date.now() - start
