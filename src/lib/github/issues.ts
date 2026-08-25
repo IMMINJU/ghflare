@@ -1,6 +1,12 @@
 import type { RawIssue } from '@/types'
 
 const GITHUB_API = 'https://api.github.com'
+// Deliberately wider than ISSUE_RETENTION_DAYS (db/issues.ts). The extra span
+// is what makes the coverage gate meaningful: reaching this cutoff proves the
+// pagination cap didn't cut into the 30-day anomaly window below. Collapsing
+// the two to the same number would make `truncated` and `baselineCovered`
+// mutually exclusive, and a capped fetch could no longer be told apart from a
+// complete one.
 const LOOKBACK_DAYS = 90
 const PER_PAGE = 100
 // Cap pagination so a single huge repo (e.g. 7k+ open issues) can't stall the
@@ -9,8 +15,8 @@ const PER_PAGE = 100
 const MAX_PAGES = 10
 // The anomaly windows (recent 7d + baseline [30d, 7d)) only need the last 30
 // days — keep in sync with getBaseline / getRecentIssueCount (db/issues.ts). A
-// fetch covering these 30 days yields a trustworthy anomaly even when the full
-// 90-day clustering window is truncated.
+// fetch covering these 30 days yields a trustworthy anomaly even when the
+// retention window is truncated.
 const ANOMALY_WINDOW_DAYS = 30
 
 function githubHeaders(): HeadersInit {
@@ -49,7 +55,7 @@ async function fetchWithRetry(url: string, attempt = 1): Promise<Response> {
 export type FetchIssuesResult = {
   issues: RawIssue[]
   // True when pagination stopped at MAX_PAGES before reaching the LOOKBACK_DAYS
-  // cutoff — the 90-day window is missing its OLDER end, so clustering and the
+  // cutoff — the window is missing its OLDER end, so clustering and the
   // timeline are partial. This is NOT the anomaly gate: that's baselineCovered
   // below, which only needs the last ANOMALY_WINDOW_DAYS. If the cutoff was
   // reached normally this is false, even at exactly MAX_PAGES pages.
@@ -76,7 +82,7 @@ export async function fetchRepoIssues(
   const issues: RawIssue[] = []
   let page = 1
   // Did we stop because we ran out of in-window issues (reached the cutoff), or
-  // because we hit the page cap first? Only the latter leaves the 90-day window
+  // because we hit the page cap first? Only the latter leaves the retention window
   // partially fetched.
   let reachedCutoff = false
   // Oldest raw item (issue or PR) seen so far. Pages are created-desc, so each

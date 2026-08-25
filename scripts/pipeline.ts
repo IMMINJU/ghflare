@@ -291,7 +291,8 @@ async function main() {
   await step('deleteOldSnapshots', deleteOldSnapshots)
 
   // Storage guard (Neon free tier is 0.5GB): repos that fell out of trending
-  // otherwise hold up to 90 days of unread issues at ~6KB/row of embedding.
+  // otherwise hold a full retention window of unread issues at ~6KB/row of
+  // embedding.
   // Runs after deleteOldSnapshots so a repo whose snapshots all just aged out
   // is treated as stale in the same run. Deleting the repo row cascades to its
   // issues, clusters, snapshots and notification state — see deleteReposByIds

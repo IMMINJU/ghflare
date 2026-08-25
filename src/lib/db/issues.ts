@@ -2,6 +2,14 @@ import { sql } from './client'
 import { BODY_TRUNCATE } from '../embeddings/openai'
 import type { IssueRow, RawIssue } from '@/types'
 
+// How long an issue is kept, and equally the window the timeline and the
+// clustering read. The three have to agree: retaining less than they read
+// would show a chart that thins out at its left edge and cluster a partial
+// set. Dropped from 90 to 30 days to fit Neon's free tier — 30 is the floor,
+// because the anomaly baseline (getBaseline) compares against a 30-day
+// average and a shorter window would leave nothing to compare to.
+export const ISSUE_RETENTION_DAYS = 30
+
 export async function upsertIssues(
   repoId: number,
   issues: RawIssue[]
@@ -139,7 +147,7 @@ export async function getIssuesForClustering(
     SELECT * FROM issues
     WHERE repo_id = ${repoId}
       AND embedding IS NOT NULL
-      AND created_at >= NOW() - INTERVAL '90 days'
+      AND created_at >= NOW() - (${ISSUE_RETENTION_DAYS} || ' days')::interval
     ORDER BY created_at DESC, id DESC
   `
   return rows.map((r) => ({
@@ -157,7 +165,7 @@ export async function getTimelineData(
     SELECT TO_CHAR(DATE(created_at), 'YYYY-MM-DD') AS date, COUNT(*)::int AS count
     FROM issues
     WHERE repo_id = ${repoId}
-      AND created_at >= NOW() - INTERVAL '90 days'
+      AND created_at >= NOW() - (${ISSUE_RETENTION_DAYS} || ' days')::interval
     GROUP BY DATE(created_at)
     ORDER BY date ASC
   `
@@ -166,6 +174,7 @@ export async function getTimelineData(
 
 export async function deleteOldIssues(): Promise<void> {
   await sql`
-    DELETE FROM issues WHERE created_at < NOW() - INTERVAL '90 days'
+    DELETE FROM issues
+    WHERE created_at < NOW() - (${ISSUE_RETENTION_DAYS} || ' days')::interval
   `
 }

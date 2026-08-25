@@ -20,7 +20,7 @@ Notifications are change-driven — a repo alerts when it first spikes, escalate
 
 Each repo detail page shows:
 - **Anomaly stats** — increase %, current rate vs baseline
-- **90-day activity timeline** — with anomalous days highlighted
+- **30-day activity timeline** — with anomalous days highlighted
 - **Topic clusters** — k-means clustering on OpenAI embeddings groups issues by theme
 
 ---
@@ -50,7 +50,7 @@ Four confidence gates hold a repo at `normal` regardless of significance: too fe
 
 The Google Chat step compares each repo's level against a per-repo state table (`repo_notification_state`) and only sends on a *change* — new anomaly, escalation, or a ≥1.5× worsening — so a persistent anomaly doesn't spam the channel. The web feed and the digest both read the latest **pipeline** snapshots only; analyses triggered manually from a repo page are stored with `source='manual'` and never shift the feed's date window.
 
-Storage is bounded to fit Neon's free tier: issues are kept 90 days and snapshots 30, and once a repo has had no snapshot of either source for 14 days — it fell out of trending and the feed can't show it — the pipeline's cleanup step drops the repo row, cascading to its issues, clusters and snapshots. The row itself has to go: visiting a repo page only re-fetches from GitHub when the repo is absent from the DB, so keeping a stripped row would leave a permanently empty page. Issue bodies are stored truncated to the 500 chars the embedding input reads; they are never rendered.
+Storage is bounded to fit Neon's free tier: issues are kept 30 days and snapshots 30, and once a repo has had no snapshot of either source for 14 days — it fell out of trending and the feed can't show it — the pipeline's cleanup step drops the repo row, cascading to its issues, clusters and snapshots. The row itself has to go: visiting a repo page only re-fetches from GitHub when the repo is absent from the DB, so keeping a stripped row would leave a permanently empty page. Issue bodies are stored truncated to the 500 chars the embedding input reads; they are never rendered.
 
 ---
 
